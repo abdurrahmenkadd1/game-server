@@ -17,10 +17,9 @@ const openai = new OpenAI({
 
 const io = new Server(server, {
     cors: {
-        origin: "*", // السماح للجميع
+        origin: "*",
         methods: ["GET", "POST"]
-    },
-    transports: ['polling', 'websocket'] // نفس إعدادات الـ Client
+    }
 });
 
 // --- بيانات اللعبة ---
@@ -38,7 +37,6 @@ function generateRoomCode() {
 }
 
 // استخراج بيانات اللاعب من المصافحة (Handshake)
-// هذا يحل مشكلتك لأنك ترسل البيانات في الـ Auth
 function getPlayerData(socket) {
     const auth = socket.handshake.auth || {};
     return {
@@ -56,35 +54,36 @@ function getPlayerData(socket) {
 io.on('connection', (socket) => {
     console.log('✅ User Connected:', socket.id, 'Name:', socket.handshake.auth.name);
 
-    // تخزين بيانات اللاعب في السوكيت نفسه لاستخدامها لاحقاً
+    // تخزين بيانات اللاعب في السوكيت نفسه
     socket.userData = getPlayerData(socket);
 
-   // 1. إنشاء غرفة
-    socket.on('create_room', (hostData) => {
-        const safeData = hostData || {}; 
+    // 1. إنشاء غرفة
+    socket.on('create_room', () => {
         const roomCode = generateRoomCode();
-        const hostName = safeData.name || "Host";
-        const hostAvatar = safeData.avatar || "👑";
+        
+        // نستخدم البيانات المحفوظة من لحظة الاتصال
+        const hostPlayer = { ...socket.userData, isHost: true };
 
         rooms[roomCode] = {
-            host: socket.id, // هذا هو الرقم المهم
-            players: [{ id: socket.id, name: hostName, avatar: hostAvatar, score: 0, isHost: true }],
+            code: roomCode,
+            hostId: socket.id,
+            players: [hostPlayer],
             gameState: 'LOBBY',
-            gameData: {} 
+            gameData: {}
         };
         
         socket.join(roomCode);
         
-        // التعديل هنا: نرسل hostId بشكل صريح
+        // الرد بنفس الصيغة التي ينتظرها App.tsx
         socket.emit('room_created', { 
             code: roomCode, 
-            players: rooms[roomCode].players, 
-            hostId: socket.id, // <-- هام جداً
-            isHost: true 
+            roomCode: roomCode, // احتياط
+            players: rooms[roomCode].players 
         });
-        console.log(`🏠 Room ${roomCode} created by ${hostName} (${socket.id})`);
+        
+        console.log(`🏠 Room ${roomCode} created by ${hostPlayer.name}`);
     });
-    
+
     // 2. انضمام لغرفة
     socket.on('join_room', (codeInput) => {
         if (!codeInput) return;
@@ -106,9 +105,8 @@ io.on('connection', (socket) => {
                 
                 // إرسال للأعضاء الجدد والقدامى
                 socket.emit('joined_success', { code: roomCode, players: room.players });
-                io.to(roomCode).emit('update_players', { 
-                players: rooms[roomCode].players,
-                hostId: rooms[roomCode].host // <-- هام جداً ليعرف الجميع من المضيف
+                io.to(roomCode).emit('player_list_updated', room.players); // التحديث للجميع
+                socket.to(roomCode).emit('player_joined', newPlayer); // إشعار من انضم
                 
             } else {
                 // اللاعب موجود أصلاً، نعيد إرسال البيانات له
@@ -242,4 +240,3 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server Running on port ${PORT}`);
 });
-
