@@ -69,29 +69,29 @@ io.on('connection', (socket) => {
         socket.emit('room_created', { code: roomCode, players: rooms[roomCode].players, isHost: true });
     });
 
-    // انضمام
-    socket.on('join_room', (data) => {
-        if (!data || !data.roomCode) return;
-        const roomCode = data.roomCode.toUpperCase().trim();
-        const room = rooms[roomCode];
-        if (room) {
-            const existing = room.players.find(p => p.id === socket.id);
-            if (!existing) {
-                if (room.players.length >= 10) {
-                    socket.emit('error', { message: "الغرفة ممتلئة" });
-                    return;
-                }
-                const pName = data.name || `Player ${room.players.length + 1}`;
-                room.players.push({ id: socket.id, name: pName, avatar: data.avatar, score: 0, isHost: false });
-                socket.join(roomCode);
-            }
-            socket.emit('joined_success', { code: roomCode, players: room.players, isHost: false });
-            io.to(roomCode).emit('update_players', room.players);
-        } else {
-            socket.emit('error', { message: "الغرفة غير موجودة" });
-        }
-    });
+    // 1. إنشاء غرفة (الكود المصحح)
+    socket.on('create_room', (hostData) => {
+        // حماية: إذا وصلت البيانات فارغة، نستخدم كائناً فارغاً
+        const safeData = hostData || {}; 
+        
+        const roomCode = generateRoomCode();
+        
+        // استخدام قيم افتراضية في حال عدم وصول الاسم أو الآفتار
+        const hostName = safeData.name || "Host";
+        const hostAvatar = safeData.avatar || "👑"; // آفتار افتراضي (تاج)
 
+        rooms[roomCode] = {
+            host: socket.id,
+            players: [{ id: socket.id, name: hostName, avatar: hostAvatar, score: 0, isHost: true }],
+            gameState: 'LOBBY',
+            gameData: {} 
+        };
+        
+        socket.join(roomCode);
+        socket.emit('room_created', { code: roomCode, players: rooms[roomCode].players, isHost: true });
+        console.log(`🏠 Room ${roomCode} created by ${hostName}`);
+    });
+    
     // بدء اللعبة
     socket.on('start_game', ({ roomCode, gameType, settings }) => {
         const room = rooms[roomCode];
@@ -160,4 +160,5 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server Running on port ${PORT}`);
+
 });
