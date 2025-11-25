@@ -10,19 +10,20 @@ app.use(cors());
 
 const server = http.createServer(app);
 
-// إعداد OpenAI (سيعمل برد تلقائي إذا لم يوجد مفتاح)
+// إعداد OpenAI (اختياري)
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || "mock-key", 
 });
 
 const io = new Server(server, {
     cors: {
-        origin: "*",
+        origin: "*", // السماح للجميع
         methods: ["GET", "POST"]
-    }
+    },
+    transports: ['polling', 'websocket'] // نفس إعدادات الـ Client
 });
 
-// كلمات اللعبة
+// --- بيانات اللعبة ---
 const WORDS_DB = {
     DEFAULT: ["بيتزا", "أسد", "طائرة", "بحر", "مدرسة", "قلم", "فراولة", "روبوت", "سيارة", "كرة قدم"],
     FOOD: ["برجر", "سوشي", "كباب", "منسف", "شاورما"],
@@ -31,134 +32,213 @@ const WORDS_DB = {
 
 let rooms = {};
 
+// --- دوال مساعدة ---
 function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
 }
 
-// دالة التلميح (تعمل حتى بدون ذكاء اصطناعي الآن)
-async function getAIHint(characterName) {
-    if (!process.env.OPENAI_API_KEY) {
-        return `🤖 تلميح النظام: الشخصية تتكون من ${characterName.length} أحرف.`;
-    }
-    try {
-        const response = await openai.chat.completions.create({
-            model: "gpt-3.5-turbo",
-            messages: [{ role: "user", content: `Give a hint about "${characterName}" in Arabic without naming it.` }],
-            max_tokens: 60,
-        });
-        return response.choices[0].message.content;
-    } catch (error) {
-        return "تلميح: الشخصية مشهورة جداً!";
-    }
+// استخراج بيانات اللاعب من المصافحة (Handshake)
+// هذا يحل مشكلتك لأنك ترسل البيانات في الـ Auth
+function getPlayerData(socket) {
+    const auth = socket.handshake.auth || {};
+    return {
+        id: socket.id,
+        name: auth.name || `Player ${socket.id.substr(0,4)}`,
+        avatar: auth.avatar || '😀',
+        coins: auth.coins || 0,
+        isVip: auth.isVip || false,
+        score: 0,
+        isHost: false
+    };
 }
 
+// --- منطق الاتصال ---
 io.on('connection', (socket) => {
-    console.log('✅ User Connected:', socket.id);
+    console.log('✅ User Connected:', socket.id, 'Name:', socket.handshake.auth.name);
 
-    // إنشاء غرفة
-    socket.on('create_room', (hostData) => {
+    // تخزين بيانات اللاعب في السوكيت نفسه لاستخدامها لاحقاً
+    socket.userData = getPlayerData(socket);
+
+    // 1. إنشاء غرفة
+    socket.on('create_room', () => {
         const roomCode = generateRoomCode();
-        const hostName = hostData?.name || "Host";
+        
+        // نستخدم البيانات المحفوظة من لحظة الاتصال
+        const hostPlayer = { ...socket.userData, isHost: true };
+
         rooms[roomCode] = {
-            host: socket.id,
-            players: [{ id: socket.id, name: hostName, avatar: hostData.avatar, score: 0, isHost: true }],
+            code: roomCode,
+            hostId: socket.id,
+            players: [hostPlayer],
             gameState: 'LOBBY',
             gameData: {}
         };
-        socket.join(roomCode);
-        socket.emit('room_created', { code: roomCode, players: rooms[roomCode].players, isHost: true });
-    });
-
-    // 1. إنشاء غرفة (الكود المصحح)
-    socket.on('create_room', (hostData) => {
-        // حماية: إذا وصلت البيانات فارغة، نستخدم كائناً فارغاً
-        const safeData = hostData || {}; 
-        
-        const roomCode = generateRoomCode();
-        
-        // استخدام قيم افتراضية في حال عدم وصول الاسم أو الآفتار
-        const hostName = safeData.name || "Host";
-        const hostAvatar = safeData.avatar || "👑"; // آفتار افتراضي (تاج)
-
-        rooms[roomCode] = {
-            host: socket.id,
-            players: [{ id: socket.id, name: hostName, avatar: hostAvatar, score: 0, isHost: true }],
-            gameState: 'LOBBY',
-            gameData: {} 
-        };
         
         socket.join(roomCode);
-        socket.emit('room_created', { code: roomCode, players: rooms[roomCode].players, isHost: true });
-        console.log(`🏠 Room ${roomCode} created by ${hostName}`);
+        
+        // الرد بنفس الصيغة التي ينتظرها App.tsx
+        socket.emit('room_created', { 
+            code: roomCode, 
+            roomCode: roomCode, // احتياط
+            players: rooms[roomCode].players 
+        });
+        
+        console.log(`🏠 Room ${roomCode} created by ${hostPlayer.name}`);
     });
-    
-    // بدء اللعبة
-    socket.on('start_game', ({ roomCode, gameType, settings }) => {
+
+    // 2. انضمام لغرفة
+    socket.on('join_room', (codeInput) => {
+        if (!codeInput) return;
+        const roomCode = codeInput.toUpperCase().trim();
         const room = rooms[roomCode];
-        if (room && room.host === socket.id) {
-            room.gameState = gameType;
+
+        if (room) {
+            // منع التكرار
+            const existing = room.players.find(p => p.id === socket.id);
+            if (!existing) {
+                if (room.players.length >= 10) {
+                    socket.emit('error', { message: "الغرفة ممتلئة" });
+                    return;
+                }
+                
+                const newPlayer = { ...socket.userData, isHost: false };
+                room.players.push(newPlayer);
+                socket.join(roomCode);
+                
+                // إرسال للأعضاء الجدد والقدامى
+                socket.emit('joined_success', { code: roomCode, players: room.players });
+                io.to(roomCode).emit('player_list_updated', room.players); // التحديث للجميع
+                socket.to(roomCode).emit('player_joined', newPlayer); // إشعار من انضم
+                
+            } else {
+                // اللاعب موجود أصلاً، نعيد إرسال البيانات له
+                socket.emit('joined_success', { code: roomCode, players: room.players });
+            }
+        } else {
+            socket.emit('error', { message: "الغرفة غير موجودة" });
+        }
+    });
+
+    // 3. مغادرة الغرفة
+    socket.on('leave_room', () => {
+        handleDisconnect(socket);
+    });
+
+    // 4. بدء اللعبة
+    socket.on('start_game', ({ mode, category }) => {
+        // البحث عن الغرفة التي فيها هذا اللاعب
+        const roomCode = findRoomCodeBySocketId(socket.id);
+        if (!roomCode) return;
+        const room = rooms[roomCode];
+
+        if (room && room.hostId === socket.id) {
+            room.gameState = mode; // 'imposter' OR 'teams'
             let payload = {};
 
-            if (gameType === 'IMPOSTER') {
-                const list = WORDS_DB['DEFAULT']; 
+            if (mode === 'imposter') { // لاحظ الأحرف الصغيرة لتطابق App.tsx
+                const list = WORDS_DB['DEFAULT'];
                 const word = list[Math.floor(Math.random() * list.length)];
                 const imposter = room.players[Math.floor(Math.random() * room.players.length)];
-                payload = { word, imposterId: imposter.id };
-            } 
-            else if (gameType === 'CHARACTERS') {
+                
+                payload = { 
+                    mode: 'imposter',
+                    data: {
+                        word: word,
+                        imposterId: imposter.id,
+                        timeLeft: 60,
+                        role: 'civilian' // سيتم تعديله لكل لاعب أدناه
+                    }
+                };
+
+                // إرسال بيانات مختلفة لكل لاعب (ليعرف المحتال دوره)
+                room.players.forEach(p => {
+                    const isImposter = p.id === imposter.id;
+                    const playerPayload = { ...payload };
+                    playerPayload.data = { ...payload.data, role: isImposter ? 'imposter' : 'civilian', word: isImposter ? '???' : word };
+                    io.to(p.id).emit('game_started', playerPayload);
+                });
+
+            } else if (mode === 'teams') {
+                // تقسيم الفرق
                 const shuffled = [...room.players].sort(() => 0.5 - Math.random());
                 const mid = Math.ceil(shuffled.length / 2);
-                const red = shuffled.slice(0, mid);
-                const blue = shuffled.slice(mid);
-                room.gameData = { redTeam: red, blueTeam: blue, redCharacter: null, blueCharacter: null };
-                payload = { redTeam: red, blueTeam: blue, phase: 'SETUP' }; 
+                const red = shuffled.slice(0, mid).map(p => ({...p, team: 'RED'}));
+                const blue = shuffled.slice(mid).map(p => ({...p, team: 'BLUE'}));
+                
+                payload = {
+                    mode: 'teams',
+                    data: {
+                        redTeam: red,
+                        blueTeam: blue,
+                        currentTurnTeam: 'RED'
+                    }
+                };
+                io.to(roomCode).emit('game_started', payload);
             }
-            io.to(roomCode).emit('game_started', { gameType, gameData: payload });
         }
     });
 
-    // استقبال الشخصيات
-    socket.on('submit_character', ({ roomCode, team, character }) => {
+    // 5. طرد لاعب
+    socket.on('kick_player', (playerId) => {
+        const roomCode = findRoomCodeBySocketId(socket.id);
+        if(!roomCode) return;
         const room = rooms[roomCode];
-        if (!room) return;
-        if (team === 'RED') room.gameData.redCharacter = character;
-        if (team === 'BLUE') room.gameData.blueCharacter = character;
-        
-        // إذا الفريقين جاهزين
-        if (room.gameData.redCharacter && room.gameData.blueCharacter) {
-            io.to(roomCode).emit('start_team_gameplay', { turn: 'RED' });
+
+        if (room && room.hostId === socket.id) {
+            room.players = room.players.filter(p => p.id !== playerId);
+            io.to(roomCode).emit('player_list_updated', room.players);
+            io.to(playerId).emit('kicked_out');
+            io.sockets.sockets.get(playerId)?.leave(roomCode);
         }
     });
 
-    // طلب تلميح
-    socket.on('request_hint', async ({ roomCode, team }) => {
-        const room = rooms[roomCode];
-        if (room) {
-            // الفريق الأحمر يريد تلميحاً عن شخصية الأزرق
-            const targetChar = team === 'RED' ? room.gameData.blueCharacter : room.gameData.redCharacter;
-            if (targetChar) {
-                const hint = await getAIHint(targetChar);
-                io.to(roomCode).emit('ai_hint_response', { text: hint });
-            }
+    // 6. استخدام البطاقات (للعبة الفرق)
+    socket.on('play_card', ({ cardId, targetId }) => {
+        const roomCode = findRoomCodeBySocketId(socket.id);
+        if(roomCode) {
+            io.to(roomCode).emit('toast_notification', { message: `تم استخدام بطاقة ${cardId}!` });
+            // هنا يمكن إضافة منطق اللعبة الإضافي
         }
     });
-    
-    // طرد
-    socket.on('kick_player', ({ roomCode, playerId }) => {
-        const room = rooms[roomCode];
-        if (room && room.host === socket.id) {
-            const idx = room.players.findIndex(p => p.id === playerId);
-            if (idx !== -1) {
-                room.players.splice(idx, 1);
-                io.to(roomCode).emit('update_players', room.players);
-                io.to(playerId).emit('kicked_out');
-            }
-        }
+
+    // قطع الاتصال
+    socket.on('disconnect', () => {
+        console.log('❌ Disconnected:', socket.id);
+        handleDisconnect(socket);
     });
 });
+
+// --- دوال مساعدة داخلية ---
+
+function findRoomCodeBySocketId(id) {
+    for (let code in rooms) {
+        if (rooms[code].players.find(p => p.id === id)) return code;
+    }
+    return null;
+}
+
+function handleDisconnect(socket) {
+    const roomCode = findRoomCodeBySocketId(socket.id);
+    if (roomCode) {
+        const room = rooms[roomCode];
+        room.players = room.players.filter(p => p.id !== socket.id);
+        
+        if (room.players.length === 0) {
+            delete rooms[roomCode]; // حذف الغرفة إذا فرغت
+        } else {
+            io.to(roomCode).emit('player_list_updated', room.players);
+            // إذا خرج المضيف، نعين مضيفاً جديداً
+            if (socket.id === room.hostId) {
+                room.hostId = room.players[0].id;
+                room.players[0].isHost = true;
+                io.to(roomCode).emit('player_list_updated', room.players);
+            }
+        }
+        socket.leave(roomCode);
+    }
+}
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
     console.log(`🚀 Server Running on port ${PORT}`);
-
 });
