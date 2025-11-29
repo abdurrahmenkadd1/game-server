@@ -10,23 +10,26 @@ app.use(cors());
 
 const server = http.createServer(app);
 
-// إعداد OpenAI (اختياري)
+// 1. إعداد OpenAI (الحكم الذكي)
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY || "mock-key", 
 });
 
 const io = new Server(server, {
     cors: {
-        origin: "*",
+        origin: "*", 
         methods: ["GET", "POST"]
-    }
+    },
+    transports: ['polling', 'websocket']
 });
 
-// --- بيانات اللعبة ---
+// 2. قاعدة بيانات الكلمات (Imposter Game)
 const WORDS_DB = {
     DEFAULT: ["بيتزا", "أسد", "طائرة", "بحر", "مدرسة", "قلم", "فراولة", "روبوت", "سيارة", "كرة قدم"],
-    FOOD: ["برجر", "سوشي", "كباب", "منسف", "شاورما"],
-    JOBS: ["طبيب", "مهندس", "طيار", "نجار", "مبرمج"]
+    food: ["برجر", "سوشي", "كباب", "منسف", "شاورما", "آيس كريم", "فلافل"],
+    animals: ["فيل", "زرافة", "بطريق", "صقر", "دلفين", "كنغر", "نمر", "ذئب"],
+    jobs: ["طبيب", "مهندس", "طيار", "نجار", "مبرمج", "رائد فضاء"],
+    brands: ["آبل", "سامسونج", "نايكي", "مرسيدس", "بيبسي", "تويوتا"]
 };
 
 let rooms = {};
@@ -36,32 +39,46 @@ function generateRoomCode() {
     return Math.random().toString(36).substring(2, 6).toUpperCase();
 }
 
-// استخراج بيانات اللاعب من المصافحة (Handshake)
+// استخراج بيانات اللاعب من المصافحة (Handshake Auth)
+// هذا يطابق تماماً ما ترسله في socketService.connect
 function getPlayerData(socket) {
     const auth = socket.handshake.auth || {};
     return {
         id: socket.id,
         name: auth.name || `Player ${socket.id.substr(0,4)}`,
         avatar: auth.avatar || '😀',
-        coins: auth.coins || 0,
+        coins: auth.coins || 500, // الرصيد الافتراضي
         isVip: auth.isVip || false,
         score: 0,
         isHost: false
     };
 }
 
-// --- منطق الاتصال ---
-io.on('connection', (socket) => {
-    console.log('✅ User Connected:', socket.id, 'Name:', socket.handshake.auth.name);
+// دالة التلميح الذكي (للبطاقات)
+async function generateAIHint(characterName) {
+    if (!process.env.OPENAI_API_KEY) {
+        return `🤖 الحكم الذكي: الشخصية تتكون من ${characterName.length} حروف.`;
+    }
+    try {
+        const response = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: [{ role: "user", content: `Give a cryptic hint about "${characterName}" in Arabic.` }],
+            max_tokens: 60,
+        });
+        return `🤖 الحكم: ${response.choices[0].message.content}`;
+    } catch (e) {
+        return "🤖 الحكم: تلميح عام - الشخصية مشهورة!";
+    }
+}
 
-    // تخزين بيانات اللاعب في السوكيت نفسه
+// --- بداية الاتصال ---
+io.on('connection', (socket) => {
+    console.log('✅ Connected:', socket.id);
     socket.userData = getPlayerData(socket);
 
-    // 1. إنشاء غرفة
+    // --- 1. إنشاء غرفة ---
     socket.on('create_room', () => {
         const roomCode = generateRoomCode();
-        
-        // نستخدم البيانات المحفوظة من لحظة الاتصال
         const hostPlayer = { ...socket.userData, isHost: true };
 
         rooms[roomCode] = {
@@ -69,72 +86,73 @@ io.on('connection', (socket) => {
             hostId: socket.id,
             players: [hostPlayer],
             gameState: 'LOBBY',
-            gameData: {}
+            teamData: { redTeam: [], blueTeam: [], selections: {} }
         };
         
         socket.join(roomCode);
-        
-        // الرد بنفس الصيغة التي ينتظرها App.tsx
+        // الرد المطابق لـ App.tsx
         socket.emit('room_created', { 
             code: roomCode, 
-            roomCode: roomCode, // احتياط
-            players: rooms[roomCode].players 
+            players: rooms[roomCode].players,
+            isHost: true 
         });
-        
-        console.log(`🏠 Room ${roomCode} created by ${hostPlayer.name}`);
     });
 
-    // 2. انضمام لغرفة
-    socket.on('join_room', (codeInput) => {
-        if (!codeInput) return;
-        const roomCode = codeInput.toUpperCase().trim();
+    // --- 2. انضمام ---
+    socket.on('join_room', (code) => {
+        if (!code) return;
+        const roomCode = code.toUpperCase().trim();
         const room = rooms[roomCode];
 
         if (room) {
-            // منع التكرار
             const existing = room.players.find(p => p.id === socket.id);
             if (!existing) {
-                if (room.players.length >= 10) {
+                if (room.players.length >= 8) {
                     socket.emit('error', { message: "الغرفة ممتلئة" });
                     return;
                 }
-                
                 const newPlayer = { ...socket.userData, isHost: false };
                 room.players.push(newPlayer);
                 socket.join(roomCode);
-                
-                // إرسال للأعضاء الجدد والقدامى
-                socket.emit('joined_success', { code: roomCode, players: room.players });
-                io.to(roomCode).emit('player_list_updated', room.players); // التحديث للجميع
-                socket.to(roomCode).emit('player_joined', newPlayer); // إشعار من انضم
-                
-            } else {
-                // اللاعب موجود أصلاً، نعيد إرسال البيانات له
-                socket.emit('joined_success', { code: roomCode, players: room.players });
             }
+            
+            // إرسال النجاح
+            socket.emit('joined_success', { 
+                code: roomCode, 
+                players: room.players,
+                isHost: false 
+            });
+            
+            // تحديث القائمة للجميع (مع hostId ليقوم App.tsx بتحديد المضيف)
+            io.to(roomCode).emit('update_players', { 
+                players: room.players, 
+                hostId: room.hostId 
+            });
         } else {
             socket.emit('error', { message: "الغرفة غير موجودة" });
         }
     });
 
-    // 3. مغادرة الغرفة
+    // --- 3. مغادرة ---
     socket.on('leave_room', () => {
         handleDisconnect(socket);
     });
 
-    // 4. بدء اللعبة
-    socket.on('start_game', ({ mode, category }) => {
-        // البحث عن الغرفة التي فيها هذا اللاعب
+    // --- 4. بدء اللعبة ---
+    socket.on('start_game', ({ mode, category }) => { // App.tsx يرسل 'mode' وليس 'gameType'
         const roomCode = findRoomCodeBySocketId(socket.id);
         if (!roomCode) return;
         const room = rooms[roomCode];
 
         if (room && room.hostId === socket.id) {
-            room.gameState = mode; // 'imposter' OR 'teams'
+            room.gameState = mode;
             let payload = {};
 
-            if (mode === 'imposter') { // لاحظ الأحرف الصغيرة لتطابق App.tsx
-                const list = WORDS_DB['DEFAULT'];
+            // أ. لعبة المحتال
+            if (mode === 'imposter') {
+                // اختيار كلمة حسب الفئة
+                const catKey = category || 'DEFAULT';
+                const list = WORDS_DB[catKey] || WORDS_DB.DEFAULT;
                 const word = list[Math.floor(Math.random() * list.length)];
                 const imposter = room.players[Math.floor(Math.random() * room.players.length)];
                 
@@ -144,99 +162,21 @@ io.on('connection', (socket) => {
                         word: word,
                         imposterId: imposter.id,
                         timeLeft: 60,
-                        role: 'civilian' // سيتم تعديله لكل لاعب أدناه
+                        role: 'civilian', // Placeholder
+                        category: catKey
                     }
                 };
 
-                // إرسال بيانات مختلفة لكل لاعب (ليعرف المحتال دوره)
+                // إرسال مخصص لكل لاعب (لكشف المحتال لنفسه فقط)
                 room.players.forEach(p => {
                     const isImposter = p.id === imposter.id;
-                    const playerPayload = { ...payload };
-                    playerPayload.data = { ...payload.data, role: isImposter ? 'imposter' : 'civilian', word: isImposter ? '???' : word };
-                    io.to(p.id).emit('game_started', playerPayload);
+                    const pPayload = JSON.parse(JSON.stringify(payload));
+                    pPayload.data.role = isImposter ? 'imposter' : 'civilian';
+                    if (isImposter) pPayload.data.word = "???"; // إخفاء الكلمة عن المحتال
+                    io.to(p.id).emit('game_started', pPayload);
                 });
 
-            } else if (mode === 'teams') {
-                // تقسيم الفرق
-                const shuffled = [...room.players].sort(() => 0.5 - Math.random());
-                const mid = Math.ceil(shuffled.length / 2);
-                const red = shuffled.slice(0, mid).map(p => ({...p, team: 'RED'}));
-                const blue = shuffled.slice(mid).map(p => ({...p, team: 'BLUE'}));
-                
-                payload = {
-                    mode: 'teams',
-                    data: {
-                        redTeam: red,
-                        blueTeam: blue,
-                        currentTurnTeam: 'RED'
-                    }
-                };
-                io.to(roomCode).emit('game_started', payload);
-            }
-        }
-    });
-
-    // 5. طرد لاعب
-    socket.on('kick_player', (playerId) => {
-        const roomCode = findRoomCodeBySocketId(socket.id);
-        if(!roomCode) return;
-        const room = rooms[roomCode];
-
-        if (room && room.hostId === socket.id) {
-            room.players = room.players.filter(p => p.id !== playerId);
-            io.to(roomCode).emit('player_list_updated', room.players);
-            io.to(playerId).emit('kicked_out');
-            io.sockets.sockets.get(playerId)?.leave(roomCode);
-        }
-    });
-
-    // 6. استخدام البطاقات (للعبة الفرق)
-    socket.on('play_card', ({ cardId, targetId }) => {
-        const roomCode = findRoomCodeBySocketId(socket.id);
-        if(roomCode) {
-            io.to(roomCode).emit('toast_notification', { message: `تم استخدام بطاقة ${cardId}!` });
-            // هنا يمكن إضافة منطق اللعبة الإضافي
-        }
-    });
-
-    // قطع الاتصال
-    socket.on('disconnect', () => {
-        console.log('❌ Disconnected:', socket.id);
-        handleDisconnect(socket);
-    });
-});
-
-// --- دوال مساعدة داخلية ---
-
-function findRoomCodeBySocketId(id) {
-    for (let code in rooms) {
-        if (rooms[code].players.find(p => p.id === id)) return code;
-    }
-    return null;
-}
-
-function handleDisconnect(socket) {
-    const roomCode = findRoomCodeBySocketId(socket.id);
-    if (roomCode) {
-        const room = rooms[roomCode];
-        room.players = room.players.filter(p => p.id !== socket.id);
-        
-        if (room.players.length === 0) {
-            delete rooms[roomCode]; // حذف الغرفة إذا فرغت
-        } else {
-            io.to(roomCode).emit('player_list_updated', room.players);
-            // إذا خرج المضيف، نعين مضيفاً جديداً
-            if (socket.id === room.hostId) {
-                room.hostId = room.players[0].id;
-                room.players[0].isHost = true;
-                io.to(roomCode).emit('player_list_updated', room.players);
-            }
-        }
-        socket.leave(roomCode);
-    }
-}
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`🚀 Server Running on port ${PORT}`);
-});
+            } 
+            // ب. لعبة الفرق
+            else if (mode === 'teams') {
+                // خ
